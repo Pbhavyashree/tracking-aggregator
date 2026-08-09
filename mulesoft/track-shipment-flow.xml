@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The same integration expressed as a Mule 4 flow.
+
+  This is a companion artifact, not the deployed service. It exists because the
+  patterns in this repository — normalising carrier responses, retrying only
+  what is worth retrying, failing fast on a carrier that is down — are the
+  everyday work of an integration platform, and MuleSoft expresses them
+  declaratively rather than in application code.
+
+  Running it needs Anypoint Studio and a licence, which is why the Node
+  implementation is the one that gets deployed. The interesting comparison is
+  what each makes easy: Mule gives you retry, error mapping and transformation
+  as configuration; the Node version gives you the same behaviour as testable
+  units you can assert on. Neither is better in the abstract, and the choice
+  usually comes down to whether the team owns a platform already.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/os
+        http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:listener-config name="api-listener" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <http:request-config name="dhl-request-config" doc:name="DHL">
+        <http:request-connection host="api-eu.dhl.com" port="443" protocol="HTTPS">
+            <!-- Without a response timeout a hung carrier connection holds the
+                 flow open until the caller gives up, and we never get to retry
+                 or record the failure as ours. -->
+            <http:client-socket-properties>
+                <http:tcp-client-socket-properties connectionTimeout="5000"/>
+            </http:client-socket-properties>
+        </http:request-connection>
+    </http:request-config>
+
+    <!-- Object Store gives the same short-TTL cache the Node version keeps in
+         memory, with the advantage that it survives a redeploy. -->
+    <os:object-store name="tracking-cache"
+                     persistent="false"
+                     maxEntries="5000"
+                     entryTtl="60"
+                     entryTtlUnit="SECONDS"/>
+
+    <flow name="track-shipment-flow">
+        <http:listener config-ref="api-listener" path="/api/v1/tracking/{trackingNumber}" doc:name="GET tracking"/>
+
+        <set-variable variableName="trackingNumber"
+                      value="#[attributes.uriParams.trackingNumber]"
+                      doc:name="Capture tracking number"/>
+
+        <!-- Cache first: a cached answer costs neither quota nor latency, so
+             there is no reason to reach the carrier before checking. -->
+        <os:retrieve key="#[vars.trackingNumber]"
+                     objectStore="tracking-cache"
+                     target="cached"
+                     doc:name="Check cache">
+            <os:default-value><![CDATA[#[null]]]></os:default-value>
+        </os:retrieve>
+
+        <choice doc:name="Cached?">
+            <when expression="#[vars.cached != null]">
+                <ee:transform doc:name="Return cached">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.cached]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+
+            <otherwise>
+                <!-- until-successful is Mule's retry. The frequency is the
+                     base delay; Mule does not jitter it, which is a real
+                     difference from the Node implementation — under a
+                     synchronised outage every worker retries in lockstep. -->
+                <until-successful maxRetries="3" millisBetweenRetries="500" doc:name="Retry transient failures">
+                    <http:request config-ref="dhl-request-config"
+                                  method="GET"
+                                  path="/track/shipments"
+                                  doc:name="Call DHL">
+                        <http:query-params><![CDATA[#[{ trackingNumber: vars.trackingNumber }]]]></http:query-params>
+                        <http:headers><![CDATA[#[{ "DHL-API-Key": p('dhl.api.key') }]]]></http:headers>
+                        <!-- 404 and 401 are handled below rather than thrown,
+                             so until-successful does not retry an answer that
+                             will not change. -->
+                        <http:response-validator>
+                            <http:success-status-code-validator values="200,401,404"/>
+                        </http:response-validator>
+                    </http:request>
+                </until-successful>
+
+                <choice doc:name="Classify response">
+                    <when expression="#[attributes.statusCode == 404]">
+                        <ee:transform doc:name="Not found">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  statusCode: 404,
+  message: "No shipment found for " ++ vars.trackingNumber
+}]]></ee:set-payload>
+                            </ee:message>
+                            <ee:variables>
+                                <ee:set-variable variableName="httpStatus">404</ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                    </when>
+
+                    <when expression="#[attributes.statusCode == 401]">
+                        <logger level="ERROR" message="DHL rejected our API key" doc:name="Log auth failure"/>
+                        <ee:transform doc:name="Auth failure">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ statusCode: 502, message: "Carrier credentials rejected" }]]></ee:set-payload>
+                            </ee:message>
+                            <ee:variables>
+                                <ee:set-variable variableName="httpStatus">502</ee:set-variable>
+                            </ee:variables>
+                        </ee:transform>
+                    </when>
+
+                    <otherwise>
+                        <!-- The normalisation step: DHL's vocabulary mapped
+                             onto ours, so a consumer never learns which
+                             carrier answered. -->
+                        <ee:transform doc:name="Normalise to common model">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+
+fun mapStatus(code) = lower(code default "") match {
+  case "pre-transit"      -> "pre_transit"
+  case "transit"          -> "in_transit"
+  case "out-for-delivery" -> "out_for_delivery"
+  case "delivered"        -> "delivered"
+  case "failure"          -> "exception"
+  // An unmapped code is not an error: carriers add codes without telling
+  // anyone. Reporting "unknown" keeps the contract valid, and the original
+  // code is preserved alongside it.
+  else                    -> "unknown"
+}
+
+var shipment = payload.shipments[0]
+---
+{
+  trackingNumber: vars.trackingNumber,
+  carrier: "dhl",
+  status: mapStatus(shipment.status.statusCode),
+  estimatedDelivery: shipment.estimatedTimeOfDelivery,
+  events: (shipment.events default []) map (event) -> {
+    status: mapStatus(event.statusCode),
+    description: event.description default event.status default "Status update",
+    location: event.location.address.addressLocality,
+    timestamp: event.timestamp,
+    carrierStatusCode: event.statusCode
+  },
+  retrievedAt: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss'Z'"}
+}]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+
+                        <os:store key="#[vars.trackingNumber]"
+                                  objectStore="tracking-cache"
+                                  doc:name="Cache result">
+                            <os:value><![CDATA[#[payload]]]></os:value>
+                        </os:store>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <!-- Retries exhausted means the carrier is genuinely unavailable.
+                 503 with Retry-After tells the caller this is not their fault
+                 and roughly when to come back. -->
+            <on-error-continue type="MULE:RETRY_EXHAUSTED" doc:name="Carrier unavailable">
+                <logger level="WARN" message="#['DHL unavailable after retries for ' ++ vars.trackingNumber]"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ statusCode: 503, message: "Carrier is temporarily unavailable" }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="503"/>
+            </on-error-continue>
+
+            <on-error-continue type="ANY" doc:name="Unexpected">
+                <logger level="ERROR" message="#['Unhandled: ' ++ error.description]"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ statusCode: 500, message: "Internal server error" }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="500"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>

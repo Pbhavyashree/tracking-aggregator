@@ -1,0 +1,21 @@
+# Render blueprint. `render.yaml` in the repo root means the service can be
+# recreated from git rather than clicked together in a dashboard — the same
+# reason the GitOps project exists.
+services:
+  - type: web
+    name: tracking-aggregator
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: CACHE_TTL_MS
+        value: "60000"
+      - key: CARRIER_RATE_LIMIT_PER_SECOND
+        value: "5"
+      # Optional. Without it the DHL adapter reports itself unconfigured and
+      # the demo carrier handles everything, so the public deployment works
+      # for anyone with no key of their own.
+      - key: DHL_API_KEY
+        sync: false
