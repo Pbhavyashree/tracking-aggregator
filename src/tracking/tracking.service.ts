@@ -108,7 +108,11 @@ export class TrackingService {
     const carrier = this.carriers.find((c) => c.matches(trackingNumber));
     if (!carrier) {
       throw new NotFoundException(
-        `No carrier recognises the format of "${trackingNumber}"`,
+        `No carrier recognises the format of "${trackingNumber}". ` +
+          `This demo accepts DEMO-prefixed numbers, for example DEMO12345. ` +
+          `The suffixes NOTFOUND, FLAKY and DOWN force specific failure modes ` +
+          `(try DEMO88FLAKY or DEMO55DOWN). ` +
+          `Real DHL numbers route to the live carrier when DHL_API_KEY is configured.`,
       );
     }
     return carrier;
