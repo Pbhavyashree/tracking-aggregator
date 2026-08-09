@@ -29,6 +29,11 @@ async function bootstrap() {
   SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, config));
 
   const port = Number(process.env.PORT ?? 3000);
+  // A visitor who opens the bare URL should land somewhere useful, not on a
+  // 404 that reads like the service is broken.
+  app.getHttpAdapter().get('/', (_req: unknown, res: { redirect: (url: string) => void }) =>
+    res.redirect('/docs'),
+  );
   await app.listen(port, '0.0.0.0');
   new Logger('Bootstrap').log(`Listening on ${port}, docs at /docs`);
 }
