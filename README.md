@@ -180,3 +180,8 @@ The failure-path tests are the point. Anything can be tested on the happy path.
   notify-on-request behaviour.
 - **Per-consumer rate limiting**, distinct from the per-carrier limiting that
   exists now.
+- **A second live carrier.** The DHL adapter is written and tested but
+  unauthenticated: their production API requires a company domain email, which
+  a personal project does not have. Shippo and EasyPost issue sandbox keys
+  without approval and would slot in as one adapter file plus one registry
+  entry — which is the point of normalising at the adapter boundary.
