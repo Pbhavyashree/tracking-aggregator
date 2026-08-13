@@ -3,6 +3,12 @@
 One API across shipping carriers, built around the patterns that keep an
 integration standing when the thing it integrates with does not.
 
+**Live demo:** https://tracking-aggregator.onrender.com
+
+Free tier — the first request after a quiet spell takes ~50s to wake the
+instance. Try `/api/v1/tracking/DEMO12345`, then `/api/v1/tracking/DEMO88FLAKY`
+and `/api/v1/tracking/DEMO55DOWN` to watch the retry and circuit breaker work.
+
 NestJS, TypeScript, Docker, 68 tests. Deployable to Render from the blueprint in
 this repo.
 
